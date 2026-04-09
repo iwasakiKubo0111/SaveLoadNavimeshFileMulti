@@ -4,39 +4,11 @@
 #include "GameFramework/Actor.h"
 #include "NavMesh/RecastNavMesh.h"
 #include "ProceduralMeshComponent.h"
-#include "Detour/DetourNavMesh.h"
-
-// ── Unreal Insights トレース用ヘッダ ──────────────────────────────────
-// CPU プロファイリングチャンネル を有効化するために必要
-#include "ProfilingDebugging/CpuProfilerTrace.h"
-// ─────────────────────────────────────────────────────────────────────
-
 #include "NavMeshSerializer.generated.h"
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnNavMeshSaveComplete);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnNavMeshLoadComplete);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnNavMeshOperationFailed);
-
-// フレーム分割ロードの進捗を通知するデリゲート
-// 引数: 完了タイル数, 総タイル数
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnNavMeshLoadProgress, int32, LoadedTiles, int32, TotalTiles);
-
-// ──────────────────────────────────────────────────────────────────────
-// ファイルフォーマット定義
-// ──────────────────────────────────────────────────────────────────────
-namespace NavTileFile
-{
-    static constexpr uint32 Magic = 0x4E415654; // "NAVT"
-    static constexpr uint32 Version = 2;
-
-    struct FHeader
-    {
-        uint32 Magic;
-        uint32 Version;
-        int32  TileCount;
-        dtNavMeshParams NavMeshParams;
-    };
-}
 
 UCLASS()
 class SAVELOADNAVIMESHFILE_API ANavMeshSerializer : public AActor
@@ -46,45 +18,56 @@ class SAVELOADNAVIMESHFILE_API ANavMeshSerializer : public AActor
 public:
     ANavMeshSerializer();
 
-    // ──────────────────────────────────────────
-    // 保存
-    // ──────────────────────────────────────────
+    //----------------------------------------------------------------------//
+    // 公開API（全エージェント一括操作）
+    //----------------------------------------------------------------------//
 
+    /** 全エージェントのNavMeshを一括保存（ビルド完了待ちあり） */
     UFUNCTION(BlueprintCallable, Category = "NavMesh")
-    void SaveNavTilesWhenReady(const FString& StageID, const FName& AgentName = NAME_None);
+    void SaveNavMeshWhenReady(const FString& StageID);
 
-    // ──────────────────────────────────────────
-    // ロード
-    // ──────────────────────────────────────────
-
+    /** 全エージェントのNavMeshを一括ロード・適用 */
     UFUNCTION(BlueprintCallable, Category = "NavMesh")
-    void LoadAndMergeNavTiles(const FString& StageID, const FName& AgentName = NAME_None, FVector StageOffset = FVector::ZeroVector);
+    void LoadAndApplyNavMesh(const FString& StageID, FVector StageOffset = FVector::ZeroVector);
 
+    /** 指定StageIDの保存データが（1つ以上）存在するか */
     UFUNCTION(BlueprintCallable, Category = "NavMesh")
-    void UnloadNavTiles(const FString& StageID, const FName& AgentName = NAME_None);
+    bool HasSavedNavMesh(const FString& StageID) const;
 
-    UFUNCTION(BlueprintCallable, Category = "NavMesh")
-    TArray<FString> GetLoadedStageIDs() const;
-
-    UFUNCTION(BlueprintCallable, Category = "NavMesh")
-    bool HasSavedNavMesh(const FString& StageID, const FName& AgentName = NAME_None) const;
-
-    // ──────────────────────────────────────────
-    // 可視化
-    // ──────────────────────────────────────────
-
+    /** 指定エージェントのNavMesh可視化を切り替える */
     UFUNCTION(BlueprintCallable, Category = "NavMesh|Debug")
-    void SetNavMeshVisualizationEnabled(bool bEnabled, const FName& AgentName = NAME_None);
+    void SetNavMeshVisualizationEnabled(bool bEnabled, FName AgentName);
 
+    /** 指定エージェントのNavMesh可視化が有効か */
     UFUNCTION(BlueprintCallable, Category = "NavMesh|Debug")
-    bool IsNavMeshVisualizationEnabled() const { return bIsVisualizationEnabled; }
+    bool IsNavMeshVisualizationEnabled(FName AgentName) const;
 
-    UFUNCTION(BlueprintCallable, Category = "SetViewMode|Debug")
-    void SetViewMode(EViewModeIndex ViewMode);
+    /** 指定エージェントのNavMeshだけ動的リビルドを有効化 */
+    UFUNCTION(BlueprintCallable, Category = "NavMesh")
+    void EnableNavMeshDynamicRebuild(FName AgentName);
 
-    // ──────────────────────────────────────────
+    /** 全エージェントの動的リビルドを有効化 */
+    UFUNCTION(BlueprintCallable, Category = "NavMesh")
+    void EnableNavMeshDynamicRebuildAll();
+
+    //----------------------------------------------------------------------//
+    // ビルド進捗モニタリング
+    //----------------------------------------------------------------------//
+
+    /** ビルド進捗の画面表示を開始する。
+     *  各エージェントの進捗がPrintStringで画面左上に表示される。
+     *  残りビルドタスク数ベースで進捗率を算出。
+     *  全エージェントのビルドが完了すると自動停止。 */
+    UFUNCTION(BlueprintCallable, Category = "NavMesh|Debug")
+    void StartBuildProgressMonitor();
+
+    /** ビルド進捗の画面表示を停止する */
+    UFUNCTION(BlueprintCallable, Category = "NavMesh|Debug")
+    void StopBuildProgressMonitor();
+
+    //----------------------------------------------------------------------//
     // デリゲート
-    // ──────────────────────────────────────────
+    //----------------------------------------------------------------------//
 
     UPROPERTY(BlueprintAssignable, Category = "NavMesh")
     FOnNavMeshSaveComplete OnSaveComplete;
@@ -95,140 +78,82 @@ public:
     UPROPERTY(BlueprintAssignable, Category = "NavMesh")
     FOnNavMeshOperationFailed OnOperationFailed;
 
-    UPROPERTY(BlueprintAssignable, Category = "NavMesh")
-    FOnNavMeshLoadProgress OnLoadProgress;
+    //----------------------------------------------------------------------//
+    // BP設定
+    //----------------------------------------------------------------------//
 
-    // ──────────────────────────────────────────
-    // エディタ設定
-    // ──────────────────────────────────────────
+    /** エージェント名ごとの可視化マテリアル */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NavMesh|Debug")
+    TMap<FName, TObjectPtr<UMaterialInterface>> AgentVisMaterials;
 
-    // エージェント名 → マテリアルのMap
-    // キー: AgentName (例: "Human", "BigHuman")
-    // 値:   使用するマテリアル
-    // NAME_None キーはAgentName未指定時のデフォルトとして使用
-    UPROPERTY(EditAnywhere, Category = "NavMesh|Debug")
-    TMap<FName, TObjectPtr<UMaterialInterface>> NavVisMaterialMap;
-
-    // 1フレームあたりに処理するタイル数 (エディタから調整可能)
-    UPROPERTY(EditAnywhere, Category = "NavMesh", meta = (ClampMin = "1", ClampMax = "500"))
-    int32 TilesPerFrame = 1000;
-
-protected:
-    virtual void BeginPlay() override;
-    virtual void Tick(float DeltaTime) override;
+    /** 非同期ビルド時の同時タイル生成ジョブ数上限。
+     *  大きくするほどCPUコアを多く使いビルドが高速化する。
+     *  0の場合はNavMeshのデフォルト値をそのまま使用。 */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NavMesh|Build", meta = (ClampMin = "0", UIMin = "0"))
+    int32 MaxTileJobsCount = 0;
 
 private:
-    // ── 内部実装 ──
-    void SaveNavTiles(const FString& StageID, const FName& AgentName);
-    ARecastNavMesh* GetRecastNavMeshForAgent(const FName& AgentName) const;
-    FString GetNavDataFilePath(const FString& StageID, const FName& AgentName) const;
-    static FString MakeTileKey(const FString& StageID, const FName& AgentName);
+    //----------------------------------------------------------------------//
+    // 内部ヘルパー
+    //----------------------------------------------------------------------//
 
-    void BuildNavMeshVisualization(const FName& AgentName);
-    void ClearNavMeshVisualization(const FName& AgentName = NAME_None);
+    TArray<ARecastNavMesh*> GetAllRecastNavMeshes() const;
+    ARecastNavMesh* FindNavMeshByAgentName(FName AgentName) const;
+    static FName GetAgentNameFromNavMesh(const ARecastNavMesh* NavMesh);
+    FString GetNavDataFilePath(const FString& StageID, const FString& AgentName) const;
+    void DisableNavMeshAutoRebuild() const;
+
+    //----------------------------------------------------------------------//
+    // 保存
+    //----------------------------------------------------------------------//
+
+    void SaveAllNavMeshes(const FString& StageID);
+    bool SaveSingleNavMesh(ARecastNavMesh* NavMesh, const FString& FilePath);
 
     UFUNCTION()
     void OnNavBuildFinished(ANavigationData* NavData);
 
-    UFUNCTION(BlueprintCallable, Category = "NavMesh")
-    void EnableNavMeshDynamicRebuild();
-
-    // ── ビルド完了待ち保留データ ──
     FString PendingSaveStageID;
-    FName   PendingSaveAgentName;
 
-    // ── フレーム分割ロード用の内部状態 ──
-    struct FPendingLoadState
-    {
-        // ロード対象の識別情報
-        FString                 StageID;
-        FName                   AgentName;
+    //----------------------------------------------------------------------//
+    // ロード
+    //----------------------------------------------------------------------//
 
-        // ファイルデータ・ヘッダ
-        TArray<uint8>           FileData;
-        NavTileFile::FHeader    Header;
+    void LoadAndApplyAllNavMeshes(const FString& StageID, FVector StageOffset);
+    bool LoadSingleNavMesh(ARecastNavMesh* NavMesh, const FString& FilePath, FVector StageOffset);
 
-        // ── フェーズ管理 ──
-        // TileAdd  : addTile を TilesPerFrame 枚ずつ実行するフェーズ
-        // Relink   : 追加済みタイル間の境界リンクを TilesPerFrame 枚ずつ再構築するフェーズ
-        //            (フレーム分割追加では後から追加されたタイルが先のタイルへの
-        //             リンクを持たないため、このフェーズで双方向リンクを確立する)
-        // Done     : 使用しない (RemoveAt 済みを示す番兵)
-        enum class EPhase : uint8 { TileAdd, Relink } Phase = EPhase::TileAdd;
+    FTimerHandle RegistrationWaitHandle;
+    void OnNavDataRegistrationComplete();
+    int32 PendingRegistrationCount = 0;
 
-        // ── TileAdd フェーズ用 ──
-        int32                   NextTileIndex = 0;  // 次に処理するタイルインデックス
-        int32                   ReaderOffset = 0;  // FMemoryReader のシーク位置
+    //----------------------------------------------------------------------//
+    // 可視化
+    //----------------------------------------------------------------------//
 
-        // ── Relink フェーズ用 ──
-        // O(1) な Contains を実現するための Set (TArray::Contains は O(N) で致命的に遅い)
-        TSet<uint64>            AddedRefsSet;
-        // Relink で処理する AddedRefs の次インデックス
-        int32                   NextRelinkIndex = 0;
+    void BuildNavMeshVisualizationForAgent(ARecastNavMesh* NavMesh);
+    void ClearNavMeshVisualizationForAgent(FName AgentName);
 
-        // ── 共通 ──
-        // ロード完了後に LoadedTileRefs へ登録する Ref 一覧
-        // Relink フェーズ完了時に AddedRefsSet から再構築される
-        TArray<uint64>          AddedRefs;
-
-        // オフセット情報
-        bool                    bHasOffset = false;
-        dtReal                  OffX = 0, OffY = 0, OffZ = 0;
-        int32                   TileOffsetX = 0, TileOffsetY = 0;
-
-        // 計測用タイムスタンプ
-        double                  TimeStart = 0.0;
-        double                  TimeAfterFileLoad = 0.0;
-        double                  TimeAfterTileAdd = 0.0;
-    };
-
-    TArray<FPendingLoadState> PendingLoads;
-
-    struct FPendingUnloadState
-    {
-        FString   StageID;
-        FName     AgentName;
-        TArray<uint64> Refs;       // removeTile 対象の TileRef 一覧
-        int32     NextIndex = 0;   // 次に処理する Refs のインデックス
-    };
-
-    TArray<FPendingUnloadState> PendingUnloads;
-
-    // SetupPendingLoad: ファイル検証・Params チェック・State 構築を行い PendingLoads に追加
-    void SetupPendingLoad(const FString& StageID, const FName& AgentName,
-        FVector StageOffset, TArray<uint8>&& FileData,
-        double TimeStart, double TimeAfterFileLoad);
-
-    // Tick から呼ばれるフレーム分割処理ディスパッチャ
-    void TickPendingLoads();
-    void TickPendingUnloads();
-
-    // TileAdd フェーズ: addTile を TilesPerFrame 枚処理する
-    void TickTileAdd(FPendingLoadState& State, dtNavMesh* DetourMesh);
-
-    // Relink フェーズ: 追加済みタイル間の境界リンクを TilesPerFrame 枚処理する
-    void TickRelink(FPendingLoadState& State, dtNavMesh* DetourMesh, ARecastNavMesh* NavMesh);
-
-    // 全フェーズ完了後の後処理 (NavigationSystem 通知・描画更新など)
-    void FinalizePendingLoad(FPendingLoadState& State, dtNavMesh* DetourMesh, ARecastNavMesh* NavMesh);
-
-    // ── ロード済みタイル管理 ──
-    // キー = "StageID_AgentName" 形式
-    TMap<FString, TArray<uint64>> LoadedTileRefs;
-
-    // ── 可視化 ──
     UPROPERTY()
-    UProceduralMeshComponent* NavMeshVisMesh = nullptr;
+    TMap<FName, TObjectPtr<UProceduralMeshComponent>> NavMeshVisComponents;
 
-    // エージェント名 → MeshSectionIndex
-    TMap<FName, int32> AgentVisSectionMap;
+    TSet<FName> EnabledVisAgents;
 
-    // 次に割り当てるSectionIndex
-    int32 NextVisSectionIndex = 0;
+    //----------------------------------------------------------------------//
+    // ビルド進捗モニタリング
+    //----------------------------------------------------------------------//
 
-    bool bIsVisualizationEnabled = false;
+    virtual void Tick(float DeltaTime) override;
 
-    // SetViewMode用: 元のShowFlagsを保存しておく
-    TOptional<FEngineShowFlags> SavedShowFlags;
-    TOptional<EViewModeIndex>   SavedViewModeIndex;
+    /** 進捗モニタ用: エージェントごとの初期タスク数（モニタ開始時にスナップショット） */
+    TMap<FName, int32> InitialBuildTaskCounts;
+
+    /** 進捗モニタ用: エージェントごとのPrintString用Key */
+    TMap<FName, int32> AgentDebugMsgKeys;
+
+    bool bMonitoringBuildProgress = false;
+
+    /** 初期タスク数が確定するまでの待ちフレーム（RebuildAll直後は0の場合がある） */
+    int32 MonitorWarmupFrames = 0;
+
+    int32 NextDebugMsgKey = 100;
 };
